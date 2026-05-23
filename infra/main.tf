@@ -38,29 +38,29 @@ provider "aws" {
 # 1. DATA & STORAGE TIER
 # ==============================================================
 
-# 1. -Generate a unique hex string (4 bytes = 8 characters)-
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
+module "storage" {
+  source = "../modules/storage"
+  environment = "dev"
+  prefix = "mimi"
 }
 
-
-# 2. -The Target S3 Bucket (The Trigger Source); Interpolate that stable random ID into your bucket name-
-resource "aws_s3_bucket" "upload_bucket" {
-  bucket = "mimi-lambda-uploads-${random_id.bucket_suffix.hex}"
-  force_destroy = true
+# Use moved blocks to COOP during transit into code modularity 
+# to prevent terraform from destroying existing DB and bucket
+ 
+moved {
+  from = random_id.bucket_suffix
+  to = module.storage.random_id.bucket_suffix
 }
 
-# 3. -Serverless DB: file tracking table-
-resource "aws_dynamodb_table" "file_tracking" {
-  name = "mimi_file_tracking_table"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key = "FileID" # This is the primary partition key
-  attribute {
-    name = "FileID"
-    type = "S" # S stands for String
-  }
+moved {
+  from = aws_s3_bucket.upload_bucket
+  to = module.storage.aws_s3_bucket.upload_bucket
 }
 
+moved {
+  from = aws_dynamodb_table.file_tracking
+  to = module.storage.aws_dynamodb_table.file_tracking
+}
 
 # =============================================================
 # MESSAGING TIER
@@ -79,113 +79,69 @@ resource "aws_sns_topic_subscription" "email_target" {
 
 
 # =============================================================
-# COMPUTE & EVENT TIER (LAMBDA FN)
+# 3. COMPUTE & EVENT TIER (LAMBDA FN)
 # =============================================================
 
+module "compute" {
+  source = "../modules/compute"
+  environment = "dev"
+  prefix = "mimi"
 
-# 1. Zip the Python code authomatically
-data "archive_file" "lambda_zip" {
-	type		= "zip"
-	source_file	= "${path.module}/../src/lambda_function.py"
-	output_path	= "${path.module}/lambda_function.zip"
+  lambda_role_arn = module.security.lambda_role_arn
+
+  # These are still sitting in your root main.tf for now
+  sns_topic_arn = aws_sns_topic.file_alerts.arn
+
+  # Pulling from the storage module outputs!
+  dynamodb_table_name = module.storage.dynamodb_table_name
+  bucket_id = module.storage.bucket_id
+  bucket_arn = module.storage.bucket_arn
 }
 
-# 2. Create the Lambda Function
-resource "aws_lambda_function" "s3_processor" {
-	filename	= data.archive_file.lambda_zip.output_path
-	function_name	= "mimi_s3_processor"
-	role		= aws_iam_role.lambda_exec_role.arn
-	handler		= "lambda_function.handler" # Matches filename.function_name
-	runtime		= "python3.12"		    # Standard runtime Upgrade from 3.9 to 3.12 to prevent EOL deprecation errors
-        
-        source_code_hash = data.archive_file.lambda_zip.output_base64sha256 # This forces an update every time the py code changes.
-
-        environment {
-          variables = {
-            SNS_TOPIC_ARN = aws_sns_topic.file_alerts.arn
-            DYNAMODB_TABLE = aws_dynamodb_table.file_tracking.name # New link to the DB    
-         }
-    }
-
+moved {
+  from = aws_lambda_function.s3_processor
+  to = module.compute.aws_lambda_function.s3_processor
 }
 
-# 3. Give S3 permission to invoke this specific Lambda function
-resource "aws_lambda_permission" "allow_s3" {
-  statement_id  = "AllowExecutionFromS3Bucket"
-  action	= "lambda:InvokeFunction"
-  function_name = aws_lambda_function.s3_processor.arn
-  principal	= "s3.amazonaws.com"
-  source_arn	= aws_s3_bucket.upload_bucket.arn
+moved {
+  from = aws_lambda_permission.allow_s3
+  to = module.compute.aws_lambda_permission.allow_s3
 }
 
-# 4. Tell the S3 Bucket to send notifications to Lambda
-resource "aws_s3_bucket_notification" "bucket_notification" {
-  bucket	= aws_s3_bucket.upload_bucket.id
-
-  lambda_function {
-	lambda_function_arn = aws_lambda_function.s3_processor.arn
-	events		    = ["s3:ObjectCreated:*"] # Trigger on any new file
-    }
-
-    # Ensure permission exits before creating the notification
-    depends_on = [aws_lambda_permission.allow_s3]
+moved {
+  from = aws_s3_bucket_notification.bucket_notification
+  to = module.compute.aws_s3_bucket_notification.bucket_notification
 }
 
 # =============================================================
 # 4. SECURITY TIER (IAM)
 # =============================================================
 
-# 1. -The IAM Role for Lambda (Trust Policy)-
-resource "aws_iam_role" "lambda_exec_role" {
-  name = "serverless_lambda_role"
+module "security" {
+  source = "../modules/security"
+  environment = "dev"
+  prefix = "mimi"
+
+# Pulling the SNS topic (still in root for now)
+  sns_topic_arn = aws_sns_topic.file_alerts.arn
 
 
-    # This policy telles AWS: "Allow the Lambda service to assume this role"
-    assume_role_policy = jsonencode({
-	Version		= "2012-10-17"
-	Statement	= [{
-	  Action	= "sts:AssumeRole"
-	  Effect	= "Allow"
-	  Principal	= {Service = "lambda.amazonaws.com"}
-         }]
-      })
+# Pulling from the Storage Module Outputs
+  dynamodb_table_arn = module.storage.dynamodb_table_arn
+  bucket_arn = module.storage.bucket_arn
 }
 
-# 2. -Attach the Basic Execution Policy to the Role-
-resource "aws_iam_role_policy_attachment" "lambda_policy" {
-  role	      = aws_iam_role.lambda_exec_role.name
-    # This AWS-managed policy grants permission to write logs to CloudWatch
-  policy_arn  = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+moved {
+  from = aws_iam_role.lambda_exec_role
+  to = module.security.aws_iam_role.lambda_exec_role
 }
 
-
-# 3. -Grant Lambda explicit permissioon to publish specifically to this SNS topic-
-resource "aws_iam_role_policy" "lambda_sns_policy" {
-  name = "lambda_sns_publish_policy"
-  role = aws_iam_role.lambda_exec_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-       {
-        Sid    = "AllowSNSPublish"
-        Action = "sns:Publish"
-        Effect  = "Allow"
-        Resource = aws_sns_topic.file_alerts.arn
-       },
-       {
-        Sid    = "AllowDynamoDBWrite"
-        Action = "dynamodb:PutItem"
-        Effect = "Allow"
-        Resource = aws_dynamodb_table.file_tracking.arn
-       },
-       {
-        Sid    = "AllowS3Read"
-        Action = "s3:GetObject"
-        Effect = "Allow"
-        Resource = "${aws_s3_bucket.upload_bucket.arn}/*"
-       }
-   ]
- })
+moved {
+  from = aws_iam_role_policy_attachment.lambda_policy
+  to = module.security.aws_iam_role_policy_attachment.lambda_policy
 }
 
+moved {
+  from = aws_iam_role_policy.lambda_app_policy
+  to = module.security.aws_iam_role_policy.lambda_app_policy
+}
