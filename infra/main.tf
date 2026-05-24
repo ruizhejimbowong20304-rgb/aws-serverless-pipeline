@@ -35,6 +35,16 @@ provider "aws" {
 }
 
 # ==============================================================
+# 0. NETWORK TIER
+# ==============================================================
+
+module "network" {
+ source = "../modules/network"
+ environment = "dev"
+ prefix = "mimi"
+}
+
+# ==============================================================
 # 1. DATA & STORAGE TIER
 # ==============================================================
 
@@ -96,6 +106,10 @@ module "compute" {
   dynamodb_table_name = module.storage.dynamodb_table_name
   bucket_id = module.storage.bucket_id
   bucket_arn = module.storage.bucket_arn
+
+  # The New Network Plumbing
+  subnet_id = module.network.private_subnet_id
+  security_group_id = module.network.lambda_sg_id
 }
 
 moved {
@@ -145,3 +159,49 @@ moved {
   from = aws_iam_role_policy.lambda_app_policy
   to = module.security.aws_iam_role_policy.lambda_app_policy
 }
+
+# =============================================================
+# Production Environment
+# =============================================================
+
+module "network_prod" {
+  source = "../modules/network"
+  environment = "prod"
+  prefix = "mimi"
+ }
+
+module "storage_prod" {
+  source = "../modules/storage"
+  environment = "prod"
+  prefix = "mimi"
+}
+
+module "compute_prod" {
+  source = "../modules/compute"
+  environment = "prod"
+  prefix = "mimi"
+
+  lambda_role_arn = module.security_prod.lambda_role_arn
+  sns_topic_arn = aws_sns_topic.file_alerts.arn
+
+  dynamodb_table_name = module.storage_prod.dynamodb_table_name
+  bucket_id = module.storage_prod.bucket_id
+  bucket_arn = module.storage_prod.bucket_arn
+
+  subnet_id = module.network_prod.private_subnet_id
+  security_group_id = module.network_prod.lambda_sg_id
+}
+
+module "security_prod" {
+  source = "../modules/security"
+  environment = "prod"
+  prefix = "mimi"
+
+  # Both environments can share the same SNS alert topic for this lab
+  sns_topic_arn = aws_sns_topic.file_alerts.arn
+
+  # CRITICAL: Notice how these pull from storage_prod, not storage
+  dynamodb_table_arn = module.storage_prod.dynamodb_table_arn
+  bucket_arn = module.storage_prod.bucket_arn
+}
+
